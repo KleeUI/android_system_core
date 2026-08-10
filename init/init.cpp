@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/klog.h>
 #include <sys/mount.h>
 #include <sys/signalfd.h>
 #include <sys/system_properties.h>
@@ -61,6 +62,7 @@
 #include <logwrap/logwrap.h>
 #include <processgroup/processgroup.h>
 #include <processgroup/setup.h>
+#include <private/android_filesystem_config.h>
 #include <selinux/android.h>
 #include <unwindstack/AndroidUnwinder.h>
 
@@ -1063,6 +1065,104 @@ static void StartSecondStageBootMonitor(int timeout_sec) {
     monitor_thread.detach();
 }
 
+constexpr char kKleeBootstatDir[] = "/metadata/bootstat";
+constexpr char kKleeEarlyKmsgPath[] = "/metadata/bootstat/klee_early_kmsg_v30.log";
+constexpr char kKleeEarlyLogcatPath[] = "/metadata/bootstat/klee_early_logcat_v30.log";
+constexpr char kKleeEarlyStatePath[] = "/metadata/bootstat/klee_early_state_v30.log";
+
+static bool KleeWriteDurableSnapshot(const std::string& path, const std::string& contents) {
+    const std::string temporary_path = path + ".next";
+    unique_fd fd(open(temporary_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
+    if (fd < 0 || !android::base::WriteStringToFd(contents, fd.get()) || fsync(fd.get()) != 0) {
+        unlink(temporary_path.c_str());
+        return false;
+    }
+
+    fd.reset();
+    if (rename(temporary_path.c_str(), path.c_str()) != 0) {
+        unlink(temporary_path.c_str());
+        return false;
+    }
+
+    unique_fd directory_fd(open(kKleeBootstatDir, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    return directory_fd >= 0 && fsync(directory_fd.get()) == 0;
+}
+
+static void KleeAppendFile(const char* heading, const char* path, std::string* output) {
+    output->append("[").append(heading).append("]\n");
+    std::string contents;
+    if (ReadFileToString(path, &contents)) {
+        output->append(contents);
+        if (contents.empty() || contents.back() != '\n') output->push_back('\n');
+    } else {
+        output->append("unavailable errno=").append(std::to_string(errno)).append("\n");
+    }
+}
+
+static void KleeAppendUdcState(std::string* output) {
+    output->append("[udc]\n");
+    std::unique_ptr<DIR, decltype(&closedir)> directory(opendir("/sys/class/udc"), closedir);
+    if (directory) {
+        while (dirent* entry = readdir(directory.get())) {
+            if (entry->d_name[0] != '.') output->append(entry->d_name).append("\n");
+        }
+    }
+
+    KleeAppendFile("gadget-g1-udc", "/config/usb_gadget/g1/UDC", output);
+    KleeAppendFile("gadget-a1-udc", "/config/usb_gadget/a1/UDC", output);
+}
+
+static void KleeEarlyBootLogger() {
+    mkdir(kKleeBootstatDir, 0750);
+    chown(kKleeBootstatDir, AID_SYSTEM, AID_LOG);
+    chmod(kKleeBootstatDir, 0750);
+    selinux_android_restorecon(kKleeBootstatDir, 0);
+
+    const int kernel_log_size = klogctl(KLOG_SIZE_BUFFER, nullptr, 0);
+    std::vector<char> kernel_log(kernel_log_size > 0 ? kernel_log_size : 1);
+
+    while (true) {
+        if (kernel_log_size > 0) {
+            const int bytes = klogctl(KLOG_READ_ALL, kernel_log.data(),
+                                      static_cast<int>(kernel_log.size()));
+            if (bytes > 0) {
+                KleeWriteDurableSnapshot(kKleeEarlyKmsgPath,
+                                         std::string(kernel_log.data(), bytes));
+            }
+        }
+
+        std::string logcat;
+        if (ReadFileToString("/data/misc/logd/logcat", &logcat)) {
+            KleeWriteDurableSnapshot(kKleeEarlyLogcatPath, logcat);
+        }
+
+        std::string state = StringPrintf(
+                "slot=%s bootreason=%s adbd=%s surfaceflinger=%s composer=%s completed=%s\n",
+                GetProperty("ro.boot.slot_suffix", "").c_str(),
+                GetProperty("ro.boot.bootreason", "").c_str(),
+                GetProperty("init.svc.adbd", "").c_str(),
+                GetProperty("init.svc.surfaceflinger", "").c_str(),
+                GetProperty("init.svc.vendor.qti.hardware.display.composer", "").c_str(),
+                GetProperty("sys.boot_completed", "").c_str());
+        KleeAppendFile("uptime", "/proc/uptime", &state);
+        KleeAppendFile("bootconfig", "/proc/bootconfig", &state);
+        KleeAppendFile("cmdline", "/proc/cmdline", &state);
+        KleeAppendFile("mounts", "/proc/mounts", &state);
+        KleeAppendUdcState(&state);
+        KleeWriteDurableSnapshot(kKleeEarlyStatePath, state);
+
+        if (GetProperty("sys.boot_completed", "") == "1") return;
+        std::this_thread::sleep_for(500ms);
+    }
+}
+
+static void StartKleeEarlyBootLogger() {
+    if (IsRecoveryMode() || !GetBoolProperty("ro.debuggable", false)) return;
+
+    std::thread logger_thread(&KleeEarlyBootLogger);
+    logger_thread.detach();
+}
+
 int SecondStageMain(int argc, char** argv) {
     if (REBOOT_BOOTLOADER_ON_PANIC && !AttemptingToBootNewSlot()) {
         InstallRebootSignalHandlers();
@@ -1153,6 +1253,7 @@ int SecondStageMain(int argc, char** argv) {
     InstallSignalFdHandler(&epoll);
     InstallInitNotifier(&epoll);
     StartPropertyService(&property_fd);
+    StartKleeEarlyBootLogger();
 
     // If boot_timeout property has been set in a debug build, start the boot monitor
     if (GetBoolProperty("ro.debuggable", false)) {
