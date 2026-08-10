@@ -15,6 +15,7 @@
  */
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "action.h"
@@ -34,13 +35,23 @@ namespace init {
 namespace {
 
 constexpr char kKleeInitTracePath[] = "/metadata/bootstat/klee_init_trace_v24.log";
+constexpr off_t kKleeInitTraceLimit = 1024 * 1024;
 
 void KleeInitTrace(const std::string& message) {
     if (!android::base::GetBoolProperty("ro.debuggable", false)) return;
 
     const int saved_errno = errno;
-    const int fd = open(kKleeInitTracePath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    struct stat trace_stat = {};
+    const bool reset_trace =
+            stat(kKleeInitTracePath, &trace_stat) == 0 && trace_stat.st_size >= kKleeInitTraceLimit;
+    int flags = O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC;
+    if (reset_trace) flags |= O_TRUNC;
+
+    const int fd = open(kKleeInitTracePath, flags, 0600);
     if (fd >= 0) {
+        if (reset_trace) {
+            android::base::WriteStringToFd("=== Klee init trace restarted at 1 MiB ===\n", fd);
+        }
         android::base::WriteStringToFd(message + "\n", fd);
         fsync(fd);
         close(fd);

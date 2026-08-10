@@ -82,14 +82,26 @@ namespace {
 
 constexpr char kKleeServiceReapTracePath[] =
         "/metadata/bootstat/klee_service_reap_v25.log";
+constexpr off_t kKleeServiceReapTraceLimit = 256 * 1024;
+constexpr size_t kKleeTombstoneLimit = 1024 * 1024;
+constexpr size_t kKleeLogcatLimit = 2 * 1024 * 1024;
 
 void KleeServiceReapTrace(const std::string& name, pid_t pid, const siginfo_t& siginfo) {
     if (!GetBoolProperty("ro.debuggable", false)) return;
 
     const int saved_errno = errno;
-    const int fd = open(kKleeServiceReapTracePath,
-                        O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    struct stat trace_stat = {};
+    const bool reset_trace = stat(kKleeServiceReapTracePath, &trace_stat) == 0 &&
+                             trace_stat.st_size >= kKleeServiceReapTraceLimit;
+    int flags = O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC;
+    if (reset_trace) flags |= O_TRUNC;
+
+    const int fd = open(kKleeServiceReapTracePath, flags, 0600);
     if (fd >= 0) {
+        if (reset_trace) {
+            android::base::WriteStringToFd(
+                    "=== Klee service reap trace restarted at 256 KiB ===\n", fd);
+        }
         const std::string line = StringPrintf(
                 "service=%s pid=%d si_code=%d si_status=%d\n", name.c_str(), pid,
                 siginfo.si_code, siginfo.si_status);
@@ -100,12 +112,16 @@ void KleeServiceReapTrace(const std::string& name, pid_t pid, const siginfo_t& s
     errno = saved_errno;
 }
 
-void KleeCopyCrashFile(const std::string& source, const std::string& destination) {
+void KleeCopyCrashFile(const std::string& source, const std::string& destination,
+                       size_t maximum_size) {
     std::string contents;
     if (!android::base::ReadFileToString(source, &contents)) return;
+    if (contents.size() > maximum_size) {
+        contents.erase(0, contents.size() - maximum_size);
+    }
 
     const int saved_errno = errno;
-    const int fd = open(destination.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    const int fd = open(destination.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
     if (fd >= 0) {
         android::base::WriteStringToFd(contents, fd);
         fsync(fd);
@@ -114,21 +130,47 @@ void KleeCopyCrashFile(const std::string& source, const std::string& destination
     errno = saved_errno;
 }
 
+std::string KleeNewestTombstone() {
+    std::string newest;
+    struct timespec newest_time = {};
+
+    for (int i = 0; i < 32; ++i) {
+        const std::string path = StringPrintf("/data/tombstones/tombstone_%02d", i);
+        struct stat file_stat = {};
+        if (stat(path.c_str(), &file_stat) != 0 || file_stat.st_size <= 0) continue;
+
+        if (newest.empty() || file_stat.st_mtim.tv_sec > newest_time.tv_sec ||
+            (file_stat.st_mtim.tv_sec == newest_time.tv_sec &&
+             file_stat.st_mtim.tv_nsec > newest_time.tv_nsec)) {
+            newest = path;
+            newest_time = file_stat.st_mtim;
+        }
+    }
+
+    return newest;
+}
+
 void KleeCaptureCrashArtifacts() {
     if (!GetBoolProperty("ro.debuggable", false)) return;
 
+    const int saved_errno = errno;
     constexpr char kDestination[] = "/metadata/bootstat/klee_crash_v26";
-    for (int i = 0; i < 32; ++i) {
-        const std::string name = StringPrintf("tombstone_%02d", i);
-        KleeCopyCrashFile("/data/tombstones/" + name, std::string(kDestination) + "/" + name);
-        KleeCopyCrashFile("/data/tombstones/" + name + ".pb",
-                          std::string(kDestination) + "/" + name + ".pb");
+    if (mkdir(kDestination, 0700) != 0 && errno != EEXIST) {
+        errno = saved_errno;
+        return;
     }
-    for (int i = 0; i <= 16; ++i) {
-        const std::string name = i == 0 ? "logcat" : "logcat." + std::to_string(i);
-        KleeCopyCrashFile("/data/misc/logd/" + name,
-                          std::string(kDestination) + "/" + name);
+
+    const std::string tombstone = KleeNewestTombstone();
+    if (!tombstone.empty()) {
+        KleeCopyCrashFile(tombstone, std::string(kDestination) + "/tombstone_latest",
+                          kKleeTombstoneLimit);
+        KleeCopyCrashFile(tombstone + ".pb",
+                          std::string(kDestination) + "/tombstone_latest.pb",
+                          kKleeTombstoneLimit);
     }
+    KleeCopyCrashFile("/data/misc/logd/logcat", std::string(kDestination) + "/logcat",
+                      kKleeLogcatLimit);
+    errno = saved_errno;
 }
 
 }  // namespace
@@ -334,9 +376,10 @@ void Service::SetProcessAttributesAndCaps(InterprocessFifo setsid_finished) {
 void Service::Reap(const siginfo_t& siginfo) {
     KleeServiceReapTrace(name_, pid_, siginfo);
 
-    static unsigned int klee_composer_captures = 0;
-    if (name_ == "vendor.qti.hardware.display.composer" &&
-        klee_composer_captures++ < 4) {
+    static unsigned int klee_graphics_captures = 0;
+    if ((name_ == "surfaceflinger" ||
+         name_ == "vendor.qti.hardware.display.composer") &&
+        klee_graphics_captures++ < 4) {
         KleeCaptureCrashArtifacts();
     }
 
