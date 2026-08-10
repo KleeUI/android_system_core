@@ -14,9 +14,13 @@
  * limitations under the License.
  */
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "action.h"
 
 #include <android-base/chrono_utils.h>
+#include <android-base/file.h>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
 #include <android-base/strings.h>
@@ -27,6 +31,24 @@ using android::base::Join;
 
 namespace android {
 namespace init {
+namespace {
+
+constexpr char kKleeInitTracePath[] = "/metadata/bootstat/klee_init_trace_v24.log";
+
+void KleeInitTrace(const std::string& message) {
+    if (!android::base::GetBoolProperty("ro.debuggable", false)) return;
+
+    const int saved_errno = errno;
+    const int fd = open(kKleeInitTracePath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        android::base::WriteStringToFd(message + "\n", fd);
+        fsync(fd);
+        close(fd);
+    }
+    errno = saved_errno;
+}
+
+}  // namespace
 
 Result<void> RunBuiltinFunction(const BuiltinFunction& function,
                                 const std::vector<std::string>& args, const std::string& context) {
@@ -157,16 +179,25 @@ void Action::ExecuteAllCommands() const {
 }
 
 void Action::ExecuteCommand(const Command& command) const {
+    const std::string trigger_name = BuildTriggersString();
+    const std::string cmd_str = command.BuildCommandString();
+    const std::string location = filename_ + ":" + std::to_string(command.line());
+
+    KleeInitTrace("BEGIN action=" + trigger_name + " location=" + location +
+                  " command=" + cmd_str);
+
     android::base::Timer t;
     auto result = command.InvokeFunc(subcontext_);
     auto duration = t.duration();
 
+    KleeInitTrace("END action=" + trigger_name + " location=" + location +
+                  " duration_ms=" + std::to_string(duration.count()) + " status=" +
+                  (result.ok() ? "ok" : "failed:" + result.error().message()) +
+                  " command=" + cmd_str);
+
     // Any action longer than 50ms will be warned to user as slow operation
     if (!result.has_value() || duration > 50ms ||
         android::base::GetMinimumLogSeverity() <= android::base::DEBUG) {
-        std::string trigger_name = BuildTriggersString();
-        std::string cmd_str = command.BuildCommandString();
-
         LOG(INFO) << "Command '" << cmd_str << "' action=" << trigger_name << " (" << filename_
                   << ":" << command.line() << ") took " << duration.count() << "ms and "
                   << (result.ok() ? "succeeded" : "failed: " + result.error().message());

@@ -1224,6 +1224,13 @@ on boot && property:ro.debuggable=1
     write /dev/sys/fs/by-name/userdata/iostat_period_ms 1000
     write /dev/sys/fs/by-name/userdata/iostat_enable 1
 
+# Persist crash capture on debuggable builds when the ADB gadget is unavailable.
+on boot && property:ro.debuggable=1
+    mkdir /data/misc/logd 0750 logd log
+    setprop logd.logpersistd.enable true
+    setprop logd.logpersistd logcatd
+    start logcatd
+
 on nonencrypted
     class_start main
     class_start late_start

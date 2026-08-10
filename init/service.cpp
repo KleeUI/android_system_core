@@ -78,6 +78,60 @@ using android::base::WriteStringToFile;
 
 namespace android {
 namespace init {
+namespace {
+
+constexpr char kKleeServiceReapTracePath[] =
+        "/metadata/bootstat/klee_service_reap_v25.log";
+
+void KleeServiceReapTrace(const std::string& name, pid_t pid, const siginfo_t& siginfo) {
+    if (!GetBoolProperty("ro.debuggable", false)) return;
+
+    const int saved_errno = errno;
+    const int fd = open(kKleeServiceReapTracePath,
+                        O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (fd >= 0) {
+        const std::string line = StringPrintf(
+                "service=%s pid=%d si_code=%d si_status=%d\n", name.c_str(), pid,
+                siginfo.si_code, siginfo.si_status);
+        android::base::WriteStringToFd(line, fd);
+        fsync(fd);
+        close(fd);
+    }
+    errno = saved_errno;
+}
+
+void KleeCopyCrashFile(const std::string& source, const std::string& destination) {
+    std::string contents;
+    if (!android::base::ReadFileToString(source, &contents)) return;
+
+    const int saved_errno = errno;
+    const int fd = open(destination.c_str(), O_WRONLY | O_TRUNC | O_CLOEXEC);
+    if (fd >= 0) {
+        android::base::WriteStringToFd(contents, fd);
+        fsync(fd);
+        close(fd);
+    }
+    errno = saved_errno;
+}
+
+void KleeCaptureCrashArtifacts() {
+    if (!GetBoolProperty("ro.debuggable", false)) return;
+
+    constexpr char kDestination[] = "/metadata/bootstat/klee_crash_v26";
+    for (int i = 0; i < 32; ++i) {
+        const std::string name = StringPrintf("tombstone_%02d", i);
+        KleeCopyCrashFile("/data/tombstones/" + name, std::string(kDestination) + "/" + name);
+        KleeCopyCrashFile("/data/tombstones/" + name + ".pb",
+                          std::string(kDestination) + "/" + name + ".pb");
+    }
+    for (int i = 0; i <= 16; ++i) {
+        const std::string name = i == 0 ? "logcat" : "logcat." + std::to_string(i);
+        KleeCopyCrashFile("/data/misc/logd/" + name,
+                          std::string(kDestination) + "/" + name);
+    }
+}
+
+}  // namespace
 
 static Result<std::string> ComputeContextFromExecutable(const std::string& service_path) {
     std::string computed_context;
@@ -278,6 +332,14 @@ void Service::SetProcessAttributesAndCaps(InterprocessFifo setsid_finished) {
 }
 
 void Service::Reap(const siginfo_t& siginfo) {
+    KleeServiceReapTrace(name_, pid_, siginfo);
+
+    static unsigned int klee_composer_captures = 0;
+    if (name_ == "vendor.qti.hardware.display.composer" &&
+        klee_composer_captures++ < 4) {
+        KleeCaptureCrashArtifacts();
+    }
+
     if (!(flags_ & SVC_ONESHOT) || (flags_ & SVC_RESTART)) {
         KillProcessGroup(SIGKILL);
     } else {
