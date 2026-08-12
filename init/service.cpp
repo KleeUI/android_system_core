@@ -25,6 +25,7 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <dirent.h>
 #include <termios.h>
 #include <unistd.h>
 #include <thread>
@@ -85,6 +86,8 @@ constexpr char kKleeServiceReapTracePath[] =
 constexpr off_t kKleeServiceReapTraceLimit = 256 * 1024;
 constexpr size_t kKleeTombstoneLimit = 1024 * 1024;
 constexpr size_t kKleeLogcatLimit = 2 * 1024 * 1024;
+constexpr size_t kKleeWatchdogAnrLimit = 4 * 1024 * 1024;
+constexpr unsigned int kKleeWatchdogCaptureLimit = 4;
 
 void KleeServiceReapTrace(const std::string& name, pid_t pid, const siginfo_t& siginfo) {
     if (!GetBoolProperty("ro.debuggable", false)) return;
@@ -168,6 +171,60 @@ void KleeCaptureCrashArtifacts() {
                           std::string(kDestination) + "/tombstone_latest.pb",
                           kKleeTombstoneLimit);
     }
+    KleeCopyCrashFile("/data/misc/logd/logcat", std::string(kDestination) + "/logcat",
+                      kKleeLogcatLimit);
+    errno = saved_errno;
+}
+
+std::string KleeNewestAnrTrace() {
+    std::string newest;
+    struct timespec newest_time = {};
+    std::unique_ptr<DIR, decltype(&closedir)> directory(opendir("/data/anr"), closedir);
+    if (!directory) return newest;
+
+    while (dirent* entry = readdir(directory.get())) {
+        if (entry->d_name[0] == '.') continue;
+
+        const std::string path = std::string("/data/anr/") + entry->d_name;
+        struct stat file_stat = {};
+        if (stat(path.c_str(), &file_stat) != 0 || !S_ISREG(file_stat.st_mode) ||
+            file_stat.st_size <= 0) {
+            continue;
+        }
+
+        if (newest.empty() || file_stat.st_mtim.tv_sec > newest_time.tv_sec ||
+            (file_stat.st_mtim.tv_sec == newest_time.tv_sec &&
+             file_stat.st_mtim.tv_nsec > newest_time.tv_nsec)) {
+            newest = path;
+            newest_time = file_stat.st_mtim;
+        }
+    }
+
+    return newest;
+}
+
+void KleeCaptureWatchdogArtifacts(const siginfo_t& siginfo) {
+    if (!GetBoolProperty("ro.debuggable", false) || siginfo.si_code != CLD_KILLED ||
+        siginfo.si_status != SIGKILL) {
+        return;
+    }
+
+    static unsigned int captures = 0;
+    if (captures >= kKleeWatchdogCaptureLimit) return;
+
+    const std::string anr_trace = KleeNewestAnrTrace();
+    if (anr_trace.empty()) return;
+
+    const int saved_errno = errno;
+    constexpr char kDestination[] = "/metadata/bootstat/klee_watchdog_v27";
+    if (mkdir(kDestination, 0700) != 0 && errno != EEXIST) {
+        errno = saved_errno;
+        return;
+    }
+
+    ++captures;
+    KleeCopyCrashFile(anr_trace, std::string(kDestination) + "/anr_latest",
+                      kKleeWatchdogAnrLimit);
     KleeCopyCrashFile("/data/misc/logd/logcat", std::string(kDestination) + "/logcat",
                       kKleeLogcatLimit);
     errno = saved_errno;
@@ -375,6 +432,10 @@ void Service::SetProcessAttributesAndCaps(InterprocessFifo setsid_finished) {
 
 void Service::Reap(const siginfo_t& siginfo) {
     KleeServiceReapTrace(name_, pid_, siginfo);
+
+    if (name_ == "zygote" || name_ == "zygote64") {
+        KleeCaptureWatchdogArtifacts(siginfo);
+    }
 
     static unsigned int klee_graphics_captures = 0;
     if ((name_ == "surfaceflinger" ||
