@@ -27,11 +27,13 @@
 #include <sys/klog.h>
 #include <sys/mount.h>
 #include <sys/signalfd.h>
+#include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +44,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <android-base/chrono_utils.h>
@@ -1066,11 +1069,22 @@ static void StartSecondStageBootMonitor(int timeout_sec) {
 }
 
 constexpr char kKleeBootstatDir[] = "/metadata/bootstat";
-constexpr char kKleeEarlyKmsgPath[] = "/metadata/bootstat/klee_early_kmsg_v30.log";
-constexpr char kKleeEarlyLogcatPath[] = "/metadata/bootstat/klee_early_logcat_v30.log";
-constexpr char kKleeEarlyStatePath[] = "/metadata/bootstat/klee_early_state_v30.log";
+constexpr size_t kKleeMaxKmsgBytes = 1024 * 1024;
+constexpr size_t kKleeMaxLogcatBytes = 512 * 1024;
+constexpr size_t kKleeMaxStateBytes = 256 * 1024;
 
-static bool KleeWriteDurableSnapshot(const std::string& path, const std::string& contents) {
+struct KleeBootCheckpoint {
+    std::chrono::milliseconds uptime;
+    const char* label;
+};
+
+constexpr KleeBootCheckpoint kKleeBootCheckpoints[] = {
+        {0ms, "000ms"},   {1s, "001s"},  {3s, "003s"},  {5s, "005s"},
+        {7s, "007s"},     {8s, "008s"},  {15s, "015s"}, {30s, "030s"},
+        {60s, "060s"},    {120s, "120s"},
+};
+
+static bool KleeWriteAtomicSnapshot(const std::string& path, const std::string& contents) {
     const std::string temporary_path = path + ".next";
     unique_fd fd(open(temporary_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600));
     if (fd < 0 || !android::base::WriteStringToFd(contents, fd.get()) || fsync(fd.get()) != 0) {
@@ -1084,8 +1098,36 @@ static bool KleeWriteDurableSnapshot(const std::string& path, const std::string&
         return false;
     }
 
+    return true;
+}
+
+static void KleeSyncBootstatDirectory() {
     unique_fd directory_fd(open(kKleeBootstatDir, O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    return directory_fd >= 0 && fsync(directory_fd.get()) == 0;
+    if (directory_fd >= 0) fsync(directory_fd.get());
+}
+
+static std::string KleeLimitTail(std::string contents, size_t maximum_bytes) {
+    if (contents.size() <= maximum_bytes) return contents;
+
+    const size_t omitted_bytes = contents.size() - maximum_bytes;
+    return StringPrintf("[omitted %zu leading bytes]\n", omitted_bytes) +
+           contents.substr(omitted_bytes);
+}
+
+static std::string KleeCheckpointPath(const char* kind, const char* checkpoint) {
+    return StringPrintf("%s/klee_early_%s_v31_%s.log", kKleeBootstatDir, kind, checkpoint);
+}
+
+static void KleeClearOldCheckpoints() {
+    constexpr const char* kSnapshotKinds[] = {"kmsg", "logcat", "state"};
+    for (const auto& checkpoint : kKleeBootCheckpoints) {
+        for (const char* kind : kSnapshotKinds) {
+            const std::string path = KleeCheckpointPath(kind, checkpoint.label);
+            unlink(path.c_str());
+            unlink((path + ".next").c_str());
+        }
+    }
+    KleeSyncBootstatDirectory();
 }
 
 static void KleeAppendFile(const char* heading, const char* path, std::string* output) {
@@ -1099,12 +1141,108 @@ static void KleeAppendFile(const char* heading, const char* path, std::string* o
     }
 }
 
+static void KleeAppendDirectory(const char* heading, const char* path, const char* prefix,
+                                std::string* output) {
+    output->append("[").append(heading).append("]\n");
+    std::unique_ptr<DIR, decltype(&closedir)> directory(opendir(path), closedir);
+    if (!directory) {
+        output->append("unavailable errno=").append(std::to_string(errno)).append("\n");
+        return;
+    }
+
+    while (dirent* entry = readdir(directory.get())) {
+        if (entry->d_name[0] == '.' ||
+            (prefix[0] != '\0' && strncmp(entry->d_name, prefix, strlen(prefix)) != 0)) {
+            continue;
+        }
+        output->append(entry->d_name).append("\n");
+    }
+}
+
+static void KleeAppendModuleState(std::string* output) {
+    output->append("[modules]\n");
+    std::string contents;
+    if (!ReadFileToString("/proc/modules", &contents)) {
+        output->append("unavailable errno=").append(std::to_string(errno)).append("\n");
+        return;
+    }
+
+    for (const auto& line : android::base::Split(contents, "\n")) {
+        const size_t separator = line.find(' ');
+        if (separator != std::string::npos) {
+            output->append(line, 0, separator).append("\n");
+        }
+    }
+}
+
+static void KleeAppendProperties(std::string* output) {
+    std::map<std::string, std::string> properties;
+    __system_property_foreach(
+            [](const prop_info* property, void* cookie) {
+                __system_property_read_callback(
+                        property,
+                        [](void* inner_cookie, const char* name, const char* value, uint32_t) {
+                            static_cast<std::map<std::string, std::string>*>(inner_cookie)
+                                    ->emplace(name, value);
+                        },
+                        cookie);
+            },
+            &properties);
+
+    output->append("[properties]\n");
+    for (const auto& [name, value] : properties) {
+        output->append("[").append(name).append("]=").append(value).append("\n");
+    }
+}
+
+static void KleeAppendRemoteprocState(std::string* output) {
+    output->append("[remoteproc]\n");
+    constexpr char kRemoteprocClass[] = "/sys/class/remoteproc";
+    std::unique_ptr<DIR, decltype(&closedir)> directory(opendir(kRemoteprocClass), closedir);
+    if (!directory) {
+        output->append("unavailable errno=").append(std::to_string(errno)).append("\n");
+        return;
+    }
+
+    while (dirent* entry = readdir(directory.get())) {
+        if (entry->d_name[0] == '.') continue;
+
+        const std::string base = std::string(kRemoteprocClass) + "/" + entry->d_name;
+        std::string name;
+        std::string state;
+        ReadFileToString(base + "/name", &name);
+        ReadFileToString(base + "/state", &state);
+        output->append(entry->d_name)
+                .append(" name=")
+                .append(Trim(name))
+                .append(" state=")
+                .append(Trim(state))
+                .append("\n");
+    }
+}
+
 static void KleeAppendUdcState(std::string* output) {
     output->append("[udc]\n");
     std::unique_ptr<DIR, decltype(&closedir)> directory(opendir("/sys/class/udc"), closedir);
     if (directory) {
         while (dirent* entry = readdir(directory.get())) {
-            if (entry->d_name[0] != '.') output->append(entry->d_name).append("\n");
+            if (entry->d_name[0] == '.') continue;
+
+            const std::string base = std::string("/sys/class/udc/") + entry->d_name;
+            std::string state;
+            std::string current_speed;
+            std::string maximum_speed;
+            ReadFileToString(base + "/state", &state);
+            ReadFileToString(base + "/current_speed", &current_speed);
+            ReadFileToString(base + "/maximum_speed", &maximum_speed);
+            output->append(entry->d_name)
+                    .append(" state=")
+                    .append(Trim(state))
+                    .append(" current_speed=")
+                    .append(Trim(current_speed))
+                    .append(" maximum_speed=")
+                    .append(Trim(maximum_speed))
+                    .append("\n");
         }
     }
 
@@ -1113,46 +1251,107 @@ static void KleeAppendUdcState(std::string* output) {
 }
 
 static void KleeEarlyBootLogger() {
-    mkdir(kKleeBootstatDir, 0750);
-    chown(kKleeBootstatDir, AID_SYSTEM, AID_LOG);
-    chmod(kKleeBootstatDir, 0750);
-    selinux_android_restorecon(kKleeBootstatDir, 0);
+    if (mkdir(kKleeBootstatDir, 0750) != 0 && errno != EEXIST) {
+        PLOG(ERROR) << "Unable to create the Klee early-boot snapshot directory";
+        return;
+    }
+
+    struct stat directory_stat {};
+    if (stat(kKleeBootstatDir, &directory_stat) != 0) {
+        PLOG(ERROR) << "Unable to inspect the Klee early-boot snapshot directory";
+        return;
+    }
+    if (!S_ISDIR(directory_stat.st_mode)) {
+        LOG(ERROR) << "Klee early-boot snapshot path is not a directory";
+        return;
+    }
+    if (chown(kKleeBootstatDir, AID_SYSTEM, AID_LOG) != 0) {
+        PLOG(WARNING) << "Unable to set Klee early-boot snapshot ownership";
+    }
+    if (chmod(kKleeBootstatDir, 0750) != 0) {
+        PLOG(WARNING) << "Unable to set Klee early-boot snapshot permissions";
+    }
+    if (selinux_android_restorecon(kKleeBootstatDir, 0) != 0) {
+        PLOG(ERROR) << "Unable to label the Klee early-boot snapshot directory";
+        return;
+    }
+    KleeClearOldCheckpoints();
 
     const int kernel_log_size = klogctl(KLOG_SIZE_BUFFER, nullptr, 0);
     std::vector<char> kernel_log(kernel_log_size > 0 ? kernel_log_size : 1);
 
-    while (true) {
+    for (const auto& checkpoint : kKleeBootCheckpoints) {
+        const boot_clock::time_point checkpoint_time(checkpoint.uptime);
+        const auto now = boot_clock::now();
+        if (now < checkpoint_time) std::this_thread::sleep_for(checkpoint_time - now);
+
+        std::string kmsg = "unavailable\n";
         if (kernel_log_size > 0) {
             const int bytes = klogctl(KLOG_READ_ALL, kernel_log.data(),
                                       static_cast<int>(kernel_log.size()));
             if (bytes > 0) {
-                KleeWriteDurableSnapshot(kKleeEarlyKmsgPath,
-                                         std::string(kernel_log.data(), bytes));
+                kmsg.assign(kernel_log.data(), bytes);
             }
         }
 
         std::string logcat;
-        if (ReadFileToString("/data/misc/logd/logcat", &logcat)) {
-            KleeWriteDurableSnapshot(kKleeEarlyLogcatPath, logcat);
+        if (!ReadFileToString("/data/misc/logd/logcat", &logcat)) {
+            logcat = StringPrintf("unavailable errno=%d\n", errno);
         }
 
+        std::string boot_id;
+        if (!ReadFileToString("/proc/sys/kernel/random/boot_id", &boot_id)) boot_id = "unavailable";
+        const auto actual_uptime = std::chrono::duration_cast<std::chrono::milliseconds>(
+                boot_clock::now().time_since_epoch());
         std::string state = StringPrintf(
-                "slot=%s bootreason=%s adbd=%s surfaceflinger=%s composer=%s completed=%s\n",
+                "checkpoint=%s target_ms=%lld actual_ms=%lld boot_id=%s "
+                "slot=%s bootmode=%s mode=%s force_normal_boot=%s bootreason=%s "
+                "adbd=%s surfaceflinger=%s composer=%s qti_composer=%s zygote=%s "
+                "audioserver=%s audio_hal=%s bootanim=%s completed=%s\n",
+                checkpoint.label, static_cast<long long>(checkpoint.uptime.count()),
+                static_cast<long long>(actual_uptime.count()), Trim(boot_id).c_str(),
                 GetProperty("ro.boot.slot_suffix", "").c_str(),
+                GetProperty("ro.bootmode", "").c_str(),
+                GetProperty("ro.boot.mode", "").c_str(),
+                GetProperty("ro.boot.force_normal_boot", "").c_str(),
                 GetProperty("ro.boot.bootreason", "").c_str(),
                 GetProperty("init.svc.adbd", "").c_str(),
                 GetProperty("init.svc.surfaceflinger", "").c_str(),
+                GetProperty("init.svc.vendor.hwcomposer-3-2", "").c_str(),
                 GetProperty("init.svc.vendor.qti.hardware.display.composer", "").c_str(),
+                GetProperty("init.svc.zygote", "").c_str(),
+                GetProperty("init.svc.audioserver", "").c_str(),
+                GetProperty("init.svc.vendor.audio-hal-aidl", "").c_str(),
+                GetProperty("init.svc.bootanim", "").c_str(),
                 GetProperty("sys.boot_completed", "").c_str());
         KleeAppendFile("uptime", "/proc/uptime", &state);
         KleeAppendFile("bootconfig", "/proc/bootconfig", &state);
         KleeAppendFile("cmdline", "/proc/cmdline", &state);
-        KleeAppendFile("mounts", "/proc/mounts", &state);
+        KleeAppendFile("mounts", "/proc/self/mounts", &state);
+        KleeAppendProperties(&state);
+        KleeAppendModuleState(&state);
+        KleeAppendRemoteprocState(&state);
+        KleeAppendDirectory("fastrpc", "/dev", "fastrpc", &state);
+        KleeAppendDirectory("sound-devices", "/dev/snd", "", &state);
+        KleeAppendFile("asound-cards", "/proc/asound/cards", &state);
+        KleeAppendDirectory("power-supplies", "/sys/class/power_supply", "", &state);
+        KleeAppendFile("battery-uevent", "/sys/class/power_supply/battery/uevent", &state);
+        KleeAppendFile("usb-uevent", "/sys/class/power_supply/usb/uevent", &state);
         KleeAppendUdcState(&state);
-        KleeWriteDurableSnapshot(kKleeEarlyStatePath, state);
+
+        bool wrote_snapshot = false;
+        wrote_snapshot |= KleeWriteAtomicSnapshot(KleeCheckpointPath("kmsg", checkpoint.label),
+                                                  KleeLimitTail(std::move(kmsg),
+                                                                kKleeMaxKmsgBytes));
+        wrote_snapshot |= KleeWriteAtomicSnapshot(KleeCheckpointPath("logcat", checkpoint.label),
+                                                  KleeLimitTail(std::move(logcat),
+                                                                kKleeMaxLogcatBytes));
+        wrote_snapshot |= KleeWriteAtomicSnapshot(KleeCheckpointPath("state", checkpoint.label),
+                                                  KleeLimitTail(std::move(state),
+                                                                kKleeMaxStateBytes));
+        if (wrote_snapshot) KleeSyncBootstatDirectory();
 
         if (GetProperty("sys.boot_completed", "") == "1") return;
-        std::this_thread::sleep_for(500ms);
     }
 }
 
