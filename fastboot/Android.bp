@@ -409,6 +409,20 @@ cc_test_host {
 }
 
 cc_test_host {
+    name: "fastboot_preserve_policy_test",
+    srcs: ["device/fastboot_preserve_policy_test.cpp"],
+    static_libs: [
+        "libgtest",
+        "libgtest_main",
+    ],
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+}
+
+cc_test_host {
     name: "fastboot_vendor_boot_img_utils_test",
     srcs: ["vendor_boot_img_utils_test.cpp"],
     static_libs: [

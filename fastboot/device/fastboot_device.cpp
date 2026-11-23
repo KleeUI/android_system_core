@@ -32,6 +32,7 @@
 #include <healthhalutils/HealthHalUtils.h>
 
 #include "constants.h"
+#include "fastboot_preserve_policy.h"
 #include "flashing.h"
 #include "tcp_client.h"
 #include "usb_client.h"
@@ -110,7 +111,11 @@ FastbootDevice::FastbootDevice()
               {FB_CMD_SNAPSHOT_UPDATE, SnapshotUpdateHandler},
               {FB_CMD_FETCH, FetchHandler},
       }),
-      boot_control_hal_(BootControlClient::WaitForService()),
+      boot_control_hal_(fastboot_preserve::CanInitializeBootControl(fastboot_preserve::GetMode(
+                                android::base::GetProperty("ro.product.device", ""),
+                                android::base::GetProperty("ro.klee.fastboot.preserve_state", "")))
+                                ? BootControlClient::WaitForService()
+                                : nullptr),
       health_hal_(get_health_service()),
       fastboot_hal_(get_fastboot_service()),
       active_slot_("") {

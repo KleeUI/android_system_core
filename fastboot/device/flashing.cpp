@@ -40,6 +40,7 @@
 #include <sparse/sparse.h>
 
 #include "fastboot_device.h"
+#include "fastboot_preserve_policy.h"
 #include "utility.h"
 
 using namespace android::fs_mgr;
@@ -174,6 +175,19 @@ static void CopyAVBFooter(std::vector<char>* data, const uint64_t block_device_s
 }
 
 int Flash(FastbootDevice* device, const std::string& partition_name) {
+    const auto preserve_mode = fastboot_preserve::GetMode(
+            android::base::GetProperty("ro.product.device", ""),
+            android::base::GetProperty("ro.klee.fastboot.preserve_state", ""));
+    if (preserve_mode == fastboot_preserve::Mode::kMisconfiguredCupid) {
+        LOG(ERROR) << "Cupid Recovery is missing the required state-preserving policy property";
+        return -EPERM;
+    }
+    if (preserve_mode == fastboot_preserve::Mode::kPreserve &&
+        !fastboot_preserve::IsAllowedAFlashTarget(partition_name, device->GetCurrentSlot())) {
+        LOG(ERROR) << "Refusing flash outside the Cupid A-slot image allowlist: " << partition_name;
+        return -EPERM;
+    }
+
     PartitionHandle handle;
     if (!OpenPartition(device, partition_name, &handle, O_WRONLY | O_DIRECT)) {
         return -ENOENT;
@@ -191,7 +205,8 @@ int Flash(FastbootDevice* device, const std::string& partition_name) {
          partition_name == "init_boot_b")) {
         CopyAVBFooter(&data, block_device_size);
     }
-    if (android::base::GetProperty("ro.system.build.type", "") != "user") {
+    if (preserve_mode != fastboot_preserve::Mode::kPreserve &&
+        android::base::GetProperty("ro.system.build.type", "") != "user") {
         WipeOverlayfsForPartition(device, partition_name);
     }
     int result = FlashBlockDevice(&handle, data);
@@ -205,6 +220,13 @@ static void RemoveScratchPartition() {
 }
 
 bool UpdateSuper(FastbootDevice* device, const std::string& super_name, bool wipe) {
+    const auto preserve_mode = fastboot_preserve::GetMode(
+            android::base::GetProperty("ro.product.device", ""),
+            android::base::GetProperty("ro.klee.fastboot.preserve_state", ""));
+    if (preserve_mode != fastboot_preserve::Mode::kLegacy) {
+        return device->WriteFail("update-super is disabled by the state-preserving Recovery policy");
+    }
+
     std::vector<char> data = std::move(device->download_data());
     if (data.empty()) {
         return device->WriteFail("No data available");

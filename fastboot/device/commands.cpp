@@ -45,6 +45,7 @@
 #include "BootControlClient.h"
 #include "constants.h"
 #include "fastboot_device.h"
+#include "fastboot_preserve_policy.h"
 #include "flashing.h"
 #include "utility.h"
 
@@ -85,6 +86,19 @@ static bool IsProtectedPartitionDuringMerge(FastbootDevice* device, const std::s
         return false;
     }
     return IsSnapshotUpdateInProgress(device);
+}
+
+static fastboot_preserve::Mode PreserveMode() {
+    return fastboot_preserve::GetMode(android::base::GetProperty("ro.product.device", ""),
+                                      android::base::GetProperty("ro.klee.fastboot.preserve_state", ""));
+}
+
+static bool PreserveDeviceState() {
+    return PreserveMode() == fastboot_preserve::Mode::kPreserve;
+}
+
+static bool PreserveModeMisconfigured() {
+    return PreserveMode() == fastboot_preserve::Mode::kMisconfiguredCupid;
 }
 
 static void GetAllVars(FastbootDevice* device, const std::string& name,
@@ -227,6 +241,13 @@ bool EraseHandler(FastbootDevice* device, const std::vector<std::string>& args) 
         return device->WriteStatus(FastbootResult::FAIL, "Invalid arguments");
     }
 
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+    if (PreserveDeviceState()) {
+        return device->WriteFail("Erase is disabled by the state-preserving Recovery policy");
+    }
+
     if (GetDeviceLockStatus()) {
         return device->WriteStatus(FastbootResult::FAIL, "Erase is not allowed on locked devices");
     }
@@ -260,6 +281,13 @@ bool EraseHandler(FastbootDevice* device, const std::vector<std::string>& args) 
 }
 
 bool OemCmdHandler(FastbootDevice* device, const std::vector<std::string>& args) {
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+    if (PreserveDeviceState()) {
+        return device->WriteFail("OEM commands are disabled by the state-preserving Recovery policy");
+    }
+
     auto fastboot_hal = device->fastboot_hal();
     if (!fastboot_hal) {
         return device->WriteStatus(FastbootResult::FAIL, "Unable to open fastboot HAL");
@@ -320,6 +348,13 @@ bool DownloadHandler(FastbootDevice* device, const std::vector<std::string>& arg
 bool SetActiveHandler(FastbootDevice* device, const std::vector<std::string>& args) {
     if (args.size() < 2) {
         return device->WriteStatus(FastbootResult::FAIL, "Missing slot argument");
+    }
+
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+    if (PreserveDeviceState()) {
+        return device->WriteFail("set_active is disabled by the state-preserving Recovery policy");
     }
 
     if (GetDeviceLockStatus()) {
@@ -486,9 +521,40 @@ bool PartitionBuilder::Write() {
     return UpdateAllPartitionMetadata(device_, super_device_, *metadata.get());
 }
 
+static fastboot_preserve::SnapshotState SnapshotStateForFlash(FastbootDevice* device,
+                                                             const std::string& name) {
+    // The preservation Recovery deliberately omits the QTI boot HAL because
+    // initializing it can write misc. Absence is unknown, never proof that a
+    // snapshot is clear; this route then refuses all flashes. Deployment uses
+    // the independently admitted root Recovery writer instead.
+    auto hal = device->boot_control_hal();
+    if (!hal || hal->getSnapshotMergeStatus() != MergeStatus::NONE) {
+        return fastboot_preserve::SnapshotState::kUnknown;
+    }
+    if (!fastboot_preserve::IsLogicalAFlashTarget(name)) {
+        return fastboot_preserve::SnapshotState::kClear;
+    }
+
+    PartitionBuilder builder(device, name);
+    if (!builder.Valid()) return fastboot_preserve::SnapshotState::kUnknown;
+    auto partition = builder->FindPartition(name);
+    if (!partition) return fastboot_preserve::SnapshotState::kUnknown;
+    if (partition->attributes() & LP_PARTITION_ATTR_UPDATED) {
+        return fastboot_preserve::SnapshotState::kActive;
+    }
+    return fastboot_preserve::SnapshotState::kClear;
+}
+
 bool CreatePartitionHandler(FastbootDevice* device, const std::vector<std::string>& args) {
     if (args.size() < 3) {
         return device->WriteFail("Invalid partition name and size");
+    }
+
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+    if (PreserveDeviceState()) {
+        return device->WriteFail("Partition creation is disabled by the state-preserving Recovery policy");
     }
 
     if (GetDeviceLockStatus()) {
@@ -529,6 +595,13 @@ bool DeletePartitionHandler(FastbootDevice* device, const std::vector<std::strin
         return device->WriteFail("Invalid partition name and size");
     }
 
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+    if (PreserveDeviceState()) {
+        return device->WriteFail("Partition deletion is disabled by the state-preserving Recovery policy");
+    }
+
     if (GetDeviceLockStatus()) {
         return device->WriteStatus(FastbootResult::FAIL, "Command not available on locked devices");
     }
@@ -549,6 +622,13 @@ bool DeletePartitionHandler(FastbootDevice* device, const std::vector<std::strin
 bool ResizePartitionHandler(FastbootDevice* device, const std::vector<std::string>& args) {
     if (args.size() < 3) {
         return device->WriteFail("Invalid partition name and size");
+    }
+
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+    if (PreserveDeviceState()) {
+        return device->WriteFail("Partition resize is disabled by the state-preserving Recovery policy");
     }
 
     if (GetDeviceLockStatus()) {
@@ -608,13 +688,24 @@ bool FlashHandler(FastbootDevice* device, const std::vector<std::string>& args) 
                                    "Flashing is not allowed on locked devices");
     }
 
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+
     const auto& partition_name = args[1];
+    if (PreserveDeviceState()) {
+        if (!fastboot_preserve::CanFlash(partition_name, device->GetCurrentSlot(),
+                                         SnapshotStateForFlash(device, partition_name))) {
+            return device->WriteFail(
+                    "Refusing flash: target is outside the A-slot allowlist or snapshot state is active/unknown");
+        }
+    }
     if (IsProtectedPartitionDuringMerge(device, partition_name)) {
         auto message = "Cannot flash " + partition_name + " while a snapshot update is in progress";
         return device->WriteFail(message);
     }
 
-    if (LogicalPartitionExists(device, partition_name)) {
+    if (!PreserveDeviceState() && LogicalPartitionExists(device, partition_name)) {
         CancelPartitionSnapshot(device, partition_name);
     }
 
@@ -634,6 +725,13 @@ bool UpdateSuperHandler(FastbootDevice* device, const std::vector<std::string>& 
         return device->WriteFail("Invalid arguments");
     }
 
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+    if (PreserveDeviceState()) {
+        return device->WriteFail("update-super is disabled by the state-preserving Recovery policy");
+    }
+
     if (GetDeviceLockStatus()) {
         return device->WriteStatus(FastbootResult::FAIL, "Command not available on locked devices");
     }
@@ -651,6 +749,13 @@ static bool IsLockedDsu() {
 bool GsiHandler(FastbootDevice* device, const std::vector<std::string>& args) {
     if (args.size() != 2) {
         return device->WriteFail("Invalid arguments");
+    }
+
+    if (PreserveModeMisconfigured()) {
+        return device->WriteFail("Cupid Recovery is missing the required state-preserving policy property");
+    }
+    if (PreserveDeviceState()) {
+        return device->WriteFail("GSI operations are disabled by the state-preserving Recovery policy");
     }
 
     AutoMountMetadata mount_metadata;
@@ -691,6 +796,10 @@ bool GsiHandler(FastbootDevice* device, const std::vector<std::string>& args) {
 }
 
 bool SnapshotUpdateHandler(FastbootDevice* device, const std::vector<std::string>& args) {
+    if (PreserveMode() != fastboot_preserve::Mode::kLegacy) {
+        return device->WriteFail("snapshot-update is disabled by the state-preserving Recovery policy");
+    }
+
     // Note that we use the HAL rather than mounting /metadata, since we want
     // our results to match the bootloader.
     auto hal = device->boot_control_hal();
